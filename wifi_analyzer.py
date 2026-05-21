@@ -150,17 +150,68 @@ CH5_BANDS = {
 ALL_5G_CHANNELS = [ch for chs in CH5_BANDS.values() for ch in chs]
 
 
+def get_connected_ssids() -> set:
+    """OS APIで現在接続中のSSIDを取得する"""
+    import platform, subprocess, re
+    connected = set()
+    system = platform.system()
+    try:
+        if system == "Windows":
+            # netsh wlan show interfaces で接続中SSIDを取得
+            out = subprocess.check_output(
+                ["netsh", "wlan", "show", "interfaces"],
+                encoding="utf-8", errors="ignore",
+                creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0,
+            )
+            for line in out.splitlines():
+                m = re.search(r"^\s*SSID\s*:\s*(.+)$", line)
+                if m and "BSSID" not in line:
+                    connected.add(m.group(1).strip())
+        elif system == "Darwin":
+            # macOS: airport コマンド
+            out = subprocess.check_output(
+                ["/System/Library/PrivateFrameworks/Apple80211.framework"
+                 "/Versions/Current/Resources/airport", "-I"],
+                encoding="utf-8", errors="ignore",
+            )
+            for line in out.splitlines():
+                m = re.search(r"^\s*SSID\s*:\s*(.+)$", line)
+                if m:
+                    connected.add(m.group(1).strip())
+        else:
+            # Linux: nmcli または iwgetid
+            try:
+                out = subprocess.check_output(
+                    ["nmcli", "-t", "-f", "ACTIVE,SSID", "dev", "wifi"],
+                    encoding="utf-8", errors="ignore",
+                )
+                for line in out.splitlines():
+                    if line.startswith("yes:"):
+                        connected.add(line[4:].strip())
+            except FileNotFoundError:
+                out = subprocess.check_output(
+                    ["iwgetid", "-r"],
+                    encoding="utf-8", errors="ignore",
+                )
+                ssid = out.strip()
+                if ssid:
+                    connected.add(ssid)
+    except Exception:
+        pass  # 取得失敗時は空セット (✓なし)
+    return connected
+
+
 def make_networks():
     return [
         # ── 2.4 GHz ──
-        Network("MyHome_2.4G",    "AA:BB:10", -42,  6, "2.4GHz", "WPA3", "ASUS",    color=COLORS[0], connected=True),
+        Network("MyHome_2.4G",    "AA:BB:10", -42,  6, "2.4GHz", "WPA3", "ASUS",    color=COLORS[0]),
         Network("Neighbor-WiFi",  "AA:BB:11", -58,  6, "2.4GHz", "WPA2", "NEC",     color=COLORS[1]),
         Network("BUFFALO-G-5678", "AA:BB:12", -65, 11, "2.4GHz", "WPA2", "Buffalo", color=COLORS[2]),
         Network("FreeWiFi",       "AA:BB:13", -72,  1, "2.4GHz", "Open", "TP-Link", color=COLORS[3]),
         Network("IoT-Network",    "AA:BB:14", -77,  1, "2.4GHz", "WPA2", "Elecom",  color=COLORS[4]),
         Network("Office-Guest",   "AA:BB:15", -80, 11, "2.4GHz", "WPA2", "Cisco",   color=COLORS[5]),
         # ── 5 GHz: UNII-1 (ch36-48) ──
-        Network("MyHome_5G",         "AA:BB:01", -38, 36, "5GHz", "WPA3", "ASUS",    color=COLORS[0], connected=True),
+        Network("MyHome_5G",         "AA:BB:01", -38, 36, "5GHz", "WPA3", "ASUS",    color=COLORS[0]),
         Network("ntcm1-8b32f1-a",    "AA:BB:02", -62, 40, "5GHz", "WPA2", "NTT",     color=COLORS[1]),
         Network("coa-grp-net-4f",    "AA:BB:03", -65, 40, "5GHz", "WPA2", "Cisco",   color=COLORS[7]),
         Network("cweb-network",       "AA:BB:04", -68, 44, "5GHz", "WPA2", "TP-Link", color=COLORS[2]),
@@ -195,30 +246,15 @@ def bell_curve(cx, sig, bw, x):
 
 
 # ── グラフ描画ヘルパー ────────────────────────────────────────────────────────
-def draw_band_axes(ax_ov, ax_main, nets, band_label,
+def draw_band_axes(ax_main, nets, band_label,
                    BG, PANEL, GRID, TICK, LABEL):
-    """1つの帯域分 (ミニマップ + メイン) を描画する共通関数"""
+    """1つの帯域分のメイングラフを描画する共通関数"""
     is_5g = all(n.band == "5GHz" for n in nets)
 
-    # ── ミニマップ ──────────────────────────────────────────────────────
-    ax_ov.set_facecolor(PANEL)
+    # ── メイングラフ ────────────────────────────────────────────────────
     freqs = [n.freq_mhz for n in nets]
     fmin, fmax = min(freqs) - 80, max(freqs) + 80
-    ax_ov.set_xlim(fmin, fmax); ax_ov.set_ylim(-100, -18)
-    for sp in ax_ov.spines.values(): sp.set_color("#333333")
-    ax_ov.tick_params(left=False, bottom=False, labelleft=False, labelbottom=False)
-    for f in [fmin, (fmin + fmax) / 2, fmax]:
-        ax_ov.text(f, -19.2, f"{int(f)} MHz",
-                   color="#888888", fontsize=7, ha="center", va="top")
-    ax_ov.plot([fmin, fmax, fmax, fmin, fmin],
-               [-20, -20, -99, -99, -20], color="#555555", lw=0.7, alpha=0.5)
-    x2 = np.linspace(fmin, fmax, 2000)
-    for n in nets:
-        y = bell_curve(n.freq_mhz, n.signal, 25, x2)
-        ax_ov.plot(x2, y, color=n.color, lw=0.8, alpha=0.85)
-        ax_ov.fill_between(x2, y, -100, color=n.color, alpha=0.12)
 
-    # ── メイングラフ ────────────────────────────────────────────────────
     ax_main.set_facecolor(PANEL)
     ax_main.set_xlim(fmin, fmax); ax_main.set_ylim(-100, -20)
     for dbm in range(-90, -20, 10):
@@ -314,6 +350,7 @@ class WifiAnalyzer:
 
     def __init__(self):
         self.all_nets   = make_networks()
+        self._update_connected()
         self.band_index = 1   # デフォルト: 5GHz
         self._tick      = 0
 
@@ -368,27 +405,21 @@ class WifiAnalyzer:
         right = outer[0, 1]
 
         if key == "両方":
-            # 2段 × 2列: 上行=ミニマップ×2、下行=メイン×2
+            # 1行 × 2列: 左=2.4GHz、右=5GHz
             inner = gridspec.GridSpecFromSubplotSpec(
-                2, 2,
+                1, 2,
                 subplot_spec=right,
-                height_ratios=[1, 5],
-                hspace=0.06, wspace=0.06,
+                wspace=0.06,
             )
-            self.ax_ov24   = self.fig.add_subplot(inner[0, 0])
-            self.ax_ov5    = self.fig.add_subplot(inner[0, 1])
-            self.ax_main24 = self.fig.add_subplot(inner[1, 0])
-            self.ax_main5  = self.fig.add_subplot(inner[1, 1])
+            self.ax_main24 = self.fig.add_subplot(inner[0, 0])
+            self.ax_main5  = self.fig.add_subplot(inner[0, 1])
         else:
-            # 2段 × 1列
+            # 1列のみ
             inner = gridspec.GridSpecFromSubplotSpec(
-                2, 1,
+                1, 1,
                 subplot_spec=right,
-                height_ratios=[1, 5],
-                hspace=0.04,
             )
-            self.ax_ov   = self.fig.add_subplot(inner[0, 0])
-            self.ax_main = self.fig.add_subplot(inner[1, 0])
+            self.ax_main = self.fig.add_subplot(inner[0, 0])
 
     # ── フィルタ ──────────────────────────────────────────────────────────────
     def _nets(self, band=None):
@@ -403,24 +434,32 @@ class WifiAnalyzer:
         if self._tick % 5 == 0:
             for n in self.all_nets:
                 n.fluctuate()
+            self._update_connected()
         self._redraw()
+
+    def _update_connected(self):
+        """接続中SSIDをOSから取得してネットワークリストに反映"""
+        connected_ssids = get_connected_ssids()
+        for n in self.all_nets:
+            n.connected = n.ssid in connected_ssids
 
     def _redraw(self):
         key = self.BAND_KEYS[self.band_index]
         if key == "両方":
-            for ax in [self.ax_ov24, self.ax_ov5, self.ax_main24, self.ax_main5]:
+            for ax in [self.ax_main24, self.ax_main5]:
                 ax.cla()
             nets24 = self._nets("2.4GHz")
             nets5  = self._nets("5GHz")
-            draw_band_axes(self.ax_ov24, self.ax_main24, nets24, "2.4 GHz",
+            draw_band_axes(self.ax_main24, nets24, "2.4 GHz",
                            self.BG, self.PANEL, self.GRID, self.TICK, self.LABEL)
-            draw_band_axes(self.ax_ov5,  self.ax_main5,  nets5,  "5 GHz",
+            draw_band_axes(self.ax_main5,  nets5,  "5 GHz",
                            self.BG, self.PANEL, self.GRID, self.TICK, self.LABEL)
         else:
-            self.ax_ov.cla(); self.ax_main.cla()
-            draw_band_axes(self.ax_ov, self.ax_main, self._nets(),
+            self.ax_main.cla()
+            draw_band_axes(self.ax_main, self._nets(),
                            self.BAND_LABELS[self.band_index],
                            self.BG, self.PANEL, self.GRID, self.TICK, self.LABEL)
+
 
     # ── バンド切り替え ────────────────────────────────────────────────────────
     def _on_band_click(self, label):
@@ -447,6 +486,26 @@ class WifiAnalyzer:
             self.fig.canvas.draw_idle()
 
     def run(self):
+        # 描画完了後に最大化 (plt.show より前に window が存在する必要あり)
+        def _maximize(event):
+            try:
+                mgr = self.fig.canvas.manager
+                try:
+                    mgr.window.showMaximized()       # Qt
+                except AttributeError:
+                    try:
+                        mgr.window.state("zoomed")   # Tk (Windows)
+                    except AttributeError:
+                        try:
+                            mgr.frame.Maximize(True) # WX
+                        except AttributeError:
+                            pass
+            except Exception:
+                pass
+            # 一度だけ実行すれば十分なので切断
+            self.fig.canvas.mpl_disconnect(self._maximize_cid)
+
+        self._maximize_cid = self.fig.canvas.mpl_connect("draw_event", _maximize)
         plt.show()
 
 
