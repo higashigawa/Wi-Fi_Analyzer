@@ -38,20 +38,38 @@ def _select_backend():
         try:
             importlib.import_module(module)
             matplotlib.use(name)
+            # Agg は非インタラクティブなのでGUIとして使えない → スキップ
+            if name == "Agg":
+                continue
             print(f"[backend] {name} を使用")
             return name
         except Exception:
             continue
-    print("[setup] PyQt5 をインストールします...")
-    subprocess.check_call(
-        [sys.executable, "-m", "pip", "install", "PyQt5", "--quiet"],
-        stdout=subprocess.DEVNULL,
-    )
-    print("[setup] PyQt5 のインストール完了")
-    matplotlib.use("Qt5Agg")
-    return "Qt5Agg"
+
+    # GUIバックエンドが見つからなかった → PyQt5 を自動インストール
+    # (EXE化時は pip が使えないため警告のみ)
+    import sys as _sys
+    if not getattr(_sys, "frozen", False):
+        print("[setup] PyQt5 をインストールします...")
+        subprocess.check_call(
+            [_sys.executable, "-m", "pip", "install", "PyQt5", "--quiet"],
+            stdout=subprocess.DEVNULL,
+        )
+        print("[setup] PyQt5 のインストール完了")
+        importlib.import_module("matplotlib.backends.backend_qt5agg")
+        matplotlib.use("Qt5Agg")
+        return "Qt5Agg"
+    else:
+        # EXE実行時: TkAgg を強制指定（--hidden-import で含めたはず）
+        print("[backend] EXEモード: TkAgg を強制指定")
+        matplotlib.use("TkAgg")
+        return "TkAgg"
 
 _select_backend()
+
+# ── Linux はフォントが小さく見えるためスケール係数を設定 ─────────────────────
+import platform as _platform
+_FS = 2.0 if _platform.system() == "Linux" else 1.0  # フォントスケール係数
 
 # ── 日本語フォント自動検出 ────────────────────────────────────────────────────
 import matplotlib.font_manager as fm
@@ -120,12 +138,21 @@ class Network:
 
     def __post_init__(self):
         self._hist = [self.signal]
+        self._base_signal = self.signal  # スキャン値の基準
 
     def fluctuate(self):
-        self.signal = max(-95, min(-20, self.signal + random.randint(-3, 3)))
+        # 基準値から±5dBm以内に収まるよう変動
+        lo = max(-95, self._base_signal - 5)
+        hi = min(-20, self._base_signal + 5)
+        self.signal = max(lo, min(hi, self.signal + random.randint(-2, 2)))
         self._hist.append(self.signal)
         if len(self._hist) > 60:
             self._hist.pop(0)
+
+    def reset_base(self, new_signal: int):
+        """スキャン時に基準値をリセット"""
+        self._base_signal = new_signal
+        self.signal = new_signal
 
     @property
     def freq_mhz(self) -> int:
@@ -201,43 +228,150 @@ def get_connected_ssids() -> set:
     return connected
 
 
-def make_networks():
+def _pct_to_dbm(pct: int) -> int:
+    """Windowsの信号強度(%)をdBmに変換"""
+    pct = max(0, min(100, pct))
+    return int(-100 + pct * 0.7)   # 0%=-100dBm, 100%=-30dBm
+
+
+def scan_networks() -> list:
+    """OSコマンドで周辺Wi-Fiをスキャンして Network リストを返す"""
+    import platform, subprocess, re
+    system = platform.system()
+    nets = []
+    color_map: dict = {}  # bssid -> color (同一SSIDでも区別)
+
+    def assign_color(bssid: str) -> str:
+        if bssid not in color_map:
+            color_map[bssid] = COLORS[len(color_map) % len(COLORS)]
+        return color_map[bssid]
+
+    try:
+        if system == "Windows":
+            flags = subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0
+            out = subprocess.check_output(
+                ["netsh", "wlan", "show", "networks", "mode=bssid"],
+                encoding="cp932", errors="ignore",
+                creationflags=flags,
+            )
+            # ブロックごとに分割して解析
+            blocks = re.split(r"\nSSID\s+\d+\s*:", out)
+            for block in blocks[1:]:
+                lines = block.splitlines()
+                ssid = lines[0].strip() if lines else "Unknown"
+                security, band, channel, signal, bssid = "WPA2", "2.4GHz", 6, -70, "00:00:00:00:00:00"
+                for line in lines:
+                    line = line.strip()
+                    m = re.match(r"認証\s*:\s*(.+)", line)
+                    if m: security = m.group(1).strip()
+                    m = re.match(r"Authentication\s*:\s*(.+)", line, re.I)
+                    if m: security = m.group(1).strip()
+                    m = re.match(r"(?:ラジオの種類|Radio type)\s*:\s*(.+)", line, re.I)
+                    if m:
+                        rt = m.group(1).strip()
+                        if "5" in rt or "ac" in rt.lower() or "ax" in rt.lower():
+                            band = "5GHz"
+                        else:
+                            band = "2.4GHz"
+                    m = re.match(r"(?:チャネル|Channel)\s*:\s*(\d+)", line, re.I)
+                    if m: channel = int(m.group(1))
+                    m = re.match(r"(?:信号|Signal)\s*:\s*(\d+)%", line, re.I)
+                    if m: signal = _pct_to_dbm(int(m.group(1)))
+                    m = re.match(r"BSSID\s+\d+\s*:\s*([\w:]+)", line, re.I)
+                    if m: bssid = m.group(1).strip()
+                if not ssid:
+                    continue
+                nets.append(Network(
+                    ssid=ssid, bssid=bssid, signal=signal,
+                    channel=channel, band=band,
+                    security=security, vendor="",
+                    color=assign_color(bssid),
+                ))
+
+        elif system == "Darwin":
+            out = subprocess.check_output(
+                ["/System/Library/PrivateFrameworks/Apple80211.framework"
+                 "/Versions/Current/Resources/airport", "-s"],
+                encoding="utf-8", errors="ignore",
+            )
+            for line in out.splitlines()[1:]:
+                parts = line.split()
+                if len(parts) < 7:
+                    continue
+                ssid = parts[0]
+                bssid = parts[1]
+                try: signal = int(parts[2])
+                except: signal = -80
+                try: channel = int(parts[3].split(",")[0])
+                except: channel = 6
+                band = "5GHz" if channel > 14 else "2.4GHz"
+                security = parts[6] if len(parts) > 6 else "WPA2"
+                nets.append(Network(
+                    ssid=ssid, bssid=bssid, signal=signal,
+                    channel=channel, band=band,
+                    security=security, vendor="",
+                    color=assign_color(bssid),
+                ))
+
+        else:
+            # Linux: nmcli
+            # -t 出力はBSSIDの":" が "\:" にエスケープされるため正しく処理する
+            out = subprocess.check_output(
+                ["nmcli", "-t", "-f",
+                 "SSID,BSSID,SIGNAL,CHAN,FREQ,SECURITY",
+                 "dev", "wifi", "list"],
+                encoding="utf-8", errors="ignore",
+            )
+            for line in out.splitlines():
+                if not line.strip():
+                    continue
+                # "\:" を一時プレースホルダ文字列に置換してから ":" で分割
+                MARK = "<<COLON>>"
+                tmp = line.replace("\:", MARK)
+                parts = tmp.split(":")
+                if len(parts) < 6:
+                    continue
+                # プレースホルダを ":" に戻す
+                parts = [p.replace(MARK, ":") for p in parts]
+                ssid     = parts[0].strip()
+                bssid    = parts[1].strip()
+                sig_str  = parts[2].strip()
+                ch_str   = parts[3].strip()
+                freq_str = parts[4].strip()
+                sec      = ":".join(parts[5:]).strip()
+                try: signal = _pct_to_dbm(int(sig_str))
+                except: signal = -80
+                try: channel = int(ch_str)
+                except: channel = 6
+                band = "5GHz" if channel > 14 else "2.4GHz"
+                nets.append(Network(
+                    ssid=ssid or "(hidden)", bssid=bssid, signal=signal,
+                    channel=channel, band=band,
+                    security=sec or "WPA2", vendor="",
+                    color=assign_color(bssid),
+                ))
+
+    except Exception as e:
+        print(f"[scan] スキャン失敗: {e}")
+
+    # スキャン結果が空なら最低限のダミーを返す
+    if not nets:
+        print("[scan] ネットワークが見つかりませんでした（デモデータを使用）")
+        nets = _demo_networks()
+    return nets
+
+
+def _demo_networks() -> list:
+    """スキャン失敗時のフォールバック用デモデータ"""
     return [
-        # ── 2.4 GHz ──
-        Network("MyHome_2.4G",    "AA:BB:10", -42,  6, "2.4GHz", "WPA3", "ASUS",    color=COLORS[0]),
-        Network("Neighbor-WiFi",  "AA:BB:11", -58,  6, "2.4GHz", "WPA2", "NEC",     color=COLORS[1]),
-        Network("BUFFALO-G-5678", "AA:BB:12", -65, 11, "2.4GHz", "WPA2", "Buffalo", color=COLORS[2]),
-        Network("FreeWiFi",       "AA:BB:13", -72,  1, "2.4GHz", "Open", "TP-Link", color=COLORS[3]),
-        Network("IoT-Network",    "AA:BB:14", -77,  1, "2.4GHz", "WPA2", "Elecom",  color=COLORS[4]),
-        Network("Office-Guest",   "AA:BB:15", -80, 11, "2.4GHz", "WPA2", "Cisco",   color=COLORS[5]),
-        # ── 5 GHz: UNII-1 (ch36-48) ──
-        Network("MyHome_5G",         "AA:BB:01", -38, 36, "5GHz", "WPA3", "ASUS",    color=COLORS[0]),
-        Network("ntcm1-8b32f1-a",    "AA:BB:02", -62, 40, "5GHz", "WPA2", "NTT",     color=COLORS[1]),
-        Network("coa-grp-net-4f",    "AA:BB:03", -65, 40, "5GHz", "WPA2", "Cisco",   color=COLORS[7]),
-        Network("cweb-network",       "AA:BB:04", -68, 44, "5GHz", "WPA2", "TP-Link", color=COLORS[2]),
-        Network("Office-5G",          "AA:BB:05", -74, 48, "5GHz", "WPA2", "Cisco",   color=COLORS[9]),
-        # ── 5 GHz: UNII-2A (ch52-64) ──
-        Network("coa-mc-net-2f",     "AA:BB:06", -78, 52, "5GHz", "WPA2", "Cisco",   color=COLORS[3]),
-        Network("coa-grp-net-2f",    "AA:BB:07", -82, 56, "5GHz", "WPA2", "Cisco",   color=COLORS[8]),
-        Network("Neighbor-5G-A",     "AA:BB:08", -71, 60, "5GHz", "WPA2", "NEC",     color=COLORS[5]),
-        Network("Guest-5G",           "AA:BB:09", -85, 64, "5GHz", "WPA2", "Netgear", color=COLORS[6]),
-        # ── 5 GHz: UNII-2C (ch100-144) ──
-        Network("Enterprise-A",      "AA:BB:0A", -66,100, "5GHz", "WPA2-E","Cisco",  color=COLORS[1]),
-        Network("Enterprise-B",      "AA:BB:0B", -70,108, "5GHz", "WPA2-E","Cisco",  color=COLORS[4]),
-        Network("Hotel-WiFi",         "AA:BB:0C", -75,116, "5GHz", "WPA2", "Ruckus",  color=COLORS[2]),
-        Network("Stadium-Net",        "AA:BB:0D", -80,124, "5GHz", "WPA2", "Aruba",   color=COLORS[7]),
-        Network("Campus-5G",          "AA:BB:0E", -73,132, "5GHz", "WPA2-E","Meraki", color=COLORS[8]),
-        Network("Hotspot-2C",         "AA:BB:0F", -88,140, "5GHz", "WPA2", "TP-Link", color=COLORS[3]),
-        # ── 5 GHz: UNII-3 (ch149-165) ──
-        Network("coa-mc-net-4f",     "AA:BB:10", -63,149, "5GHz", "WPA2", "Cisco",   color=COLORS[1]),
-        Network("cweb-network",       "AA:BB:11", -70,153, "5GHz", "WPA2", "TP-Link", color=COLORS[3]),
-        Network("coa-grp-net-4f-2",  "AA:BB:12", -72,157, "5GHz", "WPA2", "Cisco",   color=COLORS[4]),
-        Network("Neighbor-5G-B",     "AA:BB:13", -79,161, "5GHz", "WPA2", "NEC",     color=COLORS[5]),
-        Network("IoT-5G",             "AA:BB:14", -84,165, "5GHz", "WPA2", "Elecom",  color=COLORS[9]),
-        # ── 5 GHz: UNII-4 (ch169-177) ──
-        Network("NextGen-WiFi",       "AA:BB:15", -68,169, "5GHz", "WPA3", "Qualcomm",color=COLORS[6]),
-        Network("6E-Bridge",          "AA:BB:16", -77,173, "5GHz", "WPA3", "Intel",   color=COLORS[8]),
+        Network("Demo_2.4G", "AA:BB:01", -65, 6,  "2.4GHz", "WPA2", "", color=COLORS[0]),
+        Network("Demo_5G",   "AA:BB:02", -70, 36, "5GHz",   "WPA2", "", color=COLORS[1]),
     ]
+
+
+def make_networks() -> list:
+    """起動時スキャン"""
+    return scan_networks()
 
 
 def bell_curve(cx, sig, bw, x):
@@ -261,8 +395,8 @@ def draw_band_axes(ax_main, nets, band_label,
         ax_main.axhline(dbm, color=GRID, lw=0.6, zorder=0)
     ax_main.set_yticks(range(-90, -20, 10))
     ax_main.set_yticklabels([str(v) for v in range(-90, -20, 10)],
-                            color=TICK, fontsize=9)
-    ax_main.set_ylabel("シグナル強度 [dBm]", color=LABEL, fontsize=9, labelpad=6)
+                            color=TICK, fontsize=int(9.0 * _FS))
+    ax_main.set_ylabel("シグナル強度 [dBm]", color=LABEL, fontsize=int(9.0 * _FS), labelpad=6)
 
     ch_ticks, ch_labels = [], []
     if is_5g:
@@ -276,9 +410,9 @@ def draw_band_axes(ax_main, nets, band_label,
             if fmin <= f <= fmax:
                 ch_ticks.append(f); ch_labels.append(str(ch))
     ax_main.set_xticks(ch_ticks)
-    ax_main.set_xticklabels(ch_labels, color=LABEL, fontsize=8,
+    ax_main.set_xticklabels(ch_labels, color=LABEL, fontsize=int(8.0 * _FS),
                              rotation=45, ha="right")
-    ax_main.set_xlabel("Wifi チャンネル", color=LABEL, fontsize=9, labelpad=4)
+    ax_main.set_xlabel("Wifi チャンネル", color=LABEL, fontsize=int(9.0 * _FS), labelpad=4)
     for sp in ax_main.spines.values(): sp.set_color("#333333")
     ax_main.tick_params(axis="both", length=0)
 
@@ -296,7 +430,7 @@ def draw_band_axes(ax_main, nets, band_label,
             ly -= 5; key = (round(lx / 15), round(ly / 4))
         used[key] = True
         ax_main.text(lx, ly, f"{n.ssid}{' ✓' if n.connected else ''}",
-                     color=n.color, fontsize=8.5, ha="center", va="bottom",
+                     color=n.color, fontsize=int(8.5 * _FS), ha="center", va="bottom",
                      fontweight="bold" if n.connected else "normal", zorder=4)
 
     # UNII サブバンド区切り線 (5GHz のみ)
@@ -308,7 +442,7 @@ def draw_band_axes(ax_main, nets, band_label,
             mid = (prev_f + min(boundary, fmax)) / 2
             if fmin < mid < fmax:
                 ax_main.text(mid, -21.5, unii_labels[i],
-                             color="#555555", fontsize=7.5,
+                             color="#555555", fontsize=int(7.5 * _FS),
                              ha="center", va="top", style="italic")
             if fmin < boundary < fmax:
                 ax_main.axvline(boundary, color="#444444", lw=0.8,
@@ -318,7 +452,7 @@ def draw_band_axes(ax_main, nets, band_label,
     ax_main.set_title(
         f"Wifi Analyzer   {band_label}   {len(nets)} ネットワーク"
         f"   {datetime.now().strftime('%H:%M:%S')}",
-        color="#CCCCCC", fontsize=10, pad=6, loc="left",
+        color="#CCCCCC", fontsize=int(10.0 * _FS), pad=6, loc="left",
     )
 
     seen: set = set(); handles = []
@@ -332,7 +466,7 @@ def draw_band_axes(ax_main, nets, band_label,
                    bbox_to_anchor=(1.0, 0.93),
                    loc="upper right",
                    borderaxespad=0,
-                   fontsize=7.5,
+                   fontsize=int(7.5 * _FS),
                    facecolor="#222222", edgecolor="#444444",
                    labelcolor="white", framealpha=0.88, ncol=3)
 
@@ -350,7 +484,10 @@ class WifiAnalyzer:
 
     def __init__(self):
         self.all_nets   = make_networks()
-        self._update_connected()
+        # 起動時に接続状態を反映
+        connected_ssids = get_connected_ssids()
+        for n in self.all_nets:
+            n.connected = n.ssid in connected_ssids
         self.band_index = 1   # デフォルト: 5GHz
         self._tick      = 0
 
@@ -389,7 +526,7 @@ class WifiAnalyzer:
         self.ax_radio.tick_params(
             left=False, bottom=False, labelleft=False, labelbottom=False)
         self.ax_radio.text(0.5, 0.97, "バンド", transform=self.ax_radio.transAxes,
-                           ha="center", va="top", color=self.LABEL, fontsize=9)
+                           ha="center", va="top", color=self.LABEL, fontsize=int(9.0 * _FS))
 
         self.radio = RadioButtons(
             self.ax_radio,
@@ -398,7 +535,7 @@ class WifiAnalyzer:
             activecolor="#00EEFF",
         )
         for lbl in self.radio.labels:
-            lbl.set_color(self.LABEL); lbl.set_fontsize(9)
+            lbl.set_color(self.LABEL); lbl.set_fontsize(int(9 * _FS))
         self.radio.on_clicked(self._on_band_click)
 
         # ── 右: グラフエリア ──────────────────────────────────────────
@@ -431,17 +568,28 @@ class WifiAnalyzer:
     # ── アニメーション更新 ────────────────────────────────────────────────────
     def _update(self, frame):
         self._tick += 1
+        # 5秒ごとに再スキャン
         if self._tick % 5 == 0:
-            for n in self.all_nets:
-                n.fluctuate()
-            self._update_connected()
-        self._redraw()
+            self._scan()
+            self._redraw()
 
-    def _update_connected(self):
-        """接続中SSIDをOSから取得してネットワークリストに反映"""
+    def _scan(self):
+        """Wi-Fiをスキャンしてネットワークリストを更新"""
+        nets = scan_networks()
         connected_ssids = get_connected_ssids()
-        for n in self.all_nets:
+        # 既存ネットワークの情報を引き継ぐ (color・履歴)
+        old_map = {n.bssid: n for n in self.all_nets}
+        for n in nets:
+            if n.bssid in old_map:
+                old_n = old_map[n.bssid]
+                n.color = old_n.color        # 色を維持
+                n._hist = old_n._hist        # 履歴を引き継ぎ
+            n.reset_base(n.signal)           # 基準値をスキャン結果にリセット
+            n._hist.append(n.signal)
+            if len(n._hist) > 60:
+                n._hist.pop(0)
             n.connected = n.ssid in connected_ssids
+        self.all_nets = nets
 
     def _redraw(self):
         key = self.BAND_KEYS[self.band_index]
