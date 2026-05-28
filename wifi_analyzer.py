@@ -22,6 +22,11 @@ def _ensure(pkg, import_name=None):
 
 _ensure("matplotlib")
 _ensure("numpy")
+# Windows のみ pywifi を自動インストール
+import platform as _plt_check
+if _plt_check.system() == "Windows":
+    _ensure("pywifi")
+    _ensure("comtypes")  # pywifi の依存ライブラリ
 
 # ── GUI バックエンド自動選択 ──────────────────────────────────────────────────
 import matplotlib
@@ -139,6 +144,7 @@ class Network:
     def __post_init__(self):
         self._hist = [self.signal]
         self._base_signal = self.signal  # スキャン値の基準
+        self._freq_mhz_override = None   # pywifi等から直接設定される場合
 
     def fluctuate(self):
         # 基準値から±5dBm以内に収まるよう変動
@@ -156,6 +162,8 @@ class Network:
 
     @property
     def freq_mhz(self) -> int:
+        if self._freq_mhz_override is not None:
+            return self._freq_mhz_override
         if self.band == "2.4GHz":
             return 2412 + (self.channel - 1) * 5
         # IEEE 802.11 標準: 5000 + ch * 5 (全帯域共通)
@@ -248,45 +256,46 @@ def scan_networks() -> list:
 
     try:
         if system == "Windows":
-            flags = subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0
-            out = subprocess.check_output(
-                ["netsh", "wlan", "show", "networks", "mode=bssid"],
-                encoding="cp932", errors="ignore",
-                creationflags=flags,
-            )
-            # ブロックごとに分割して解析
-            blocks = re.split(r"\nSSID\s+\d+\s*:", out)
-            for block in blocks[1:]:
-                lines = block.splitlines()
-                ssid = lines[0].strip() if lines else "Unknown"
-                security, band, channel, signal, bssid = "WPA2", "2.4GHz", 6, -70, "00:00:00:00:00:00"
-                for line in lines:
-                    line = line.strip()
-                    m = re.match(r"認証\s*:\s*(.+)", line)
-                    if m: security = m.group(1).strip()
-                    m = re.match(r"Authentication\s*:\s*(.+)", line, re.I)
-                    if m: security = m.group(1).strip()
-                    m = re.match(r"(?:ラジオの種類|Radio type)\s*:\s*(.+)", line, re.I)
-                    if m:
-                        rt = m.group(1).strip()
-                        if "5" in rt or "ac" in rt.lower() or "ax" in rt.lower():
-                            band = "5GHz"
-                        else:
-                            band = "2.4GHz"
-                    m = re.match(r"(?:チャネル|Channel)\s*:\s*(\d+)", line, re.I)
-                    if m: channel = int(m.group(1))
-                    m = re.match(r"(?:信号|Signal)\s*:\s*(\d+)%", line, re.I)
-                    if m: signal = _pct_to_dbm(int(m.group(1)))
-                    m = re.match(r"BSSID\s+\d+\s*:\s*([\w:]+)", line, re.I)
-                    if m: bssid = m.group(1).strip()
-                if not ssid:
-                    continue
-                nets.append(Network(
-                    ssid=ssid, bssid=bssid, signal=signal,
-                    channel=channel, band=band,
-                    security=security, vendor="",
-                    color=assign_color(bssid),
-                ))
+            # pywifi ライブラリでスキャン (位置情報不要・RSSI直取得)
+            try:
+                import pywifi
+                wifi = pywifi.PyWiFi()
+                iface = wifi.interfaces()[0]
+                iface.scan()
+                import time; time.sleep(2)
+                results = iface.scan_results()
+                for profile in results:
+                    ssid   = profile.ssid or "(hidden)"
+                    bssid  = profile.bssid.upper() if profile.bssid else "00:00:00:00:00:00"
+                    signal = int(profile.signal)
+                    # pywifi の freq は kHz単位 (例: 2412000, 5260000)
+                    freq_khz = int(getattr(profile, "freq", 2412000))
+                    freq_mhz = freq_khz // 1000
+                    # 周波数からチャンネルと帯域を計算
+                    if freq_mhz >= 5000:
+                        band    = "5GHz"
+                        # IEEE 802.11: ch = (freq - 5000) / 5
+                        channel = (freq_mhz - 5000) // 5
+                    else:
+                        band    = "2.4GHz"
+                        # ch1=2412, ch2=2417 ... ch=(freq-2412)/5+1
+                        channel = max(1, (freq_mhz - 2412) // 5 + 1)
+                    akm = getattr(profile, "akm", [])
+                    if 4 in akm:    security = "WPA3"
+                    elif 2 in akm:  security = "WPA2"
+                    elif 1 in akm:  security = "WPA"
+                    else:           security = "Open"
+                    n = Network(
+                        ssid=ssid, bssid=bssid, signal=signal,
+                        channel=channel, band=band,
+                        security=security, vendor="",
+                        color=assign_color(bssid),
+                    )
+                    # freq_mhz を直接上書きして計算誤差を防ぐ
+                    n._freq_mhz_override = freq_mhz
+                    nets.append(n)
+            except Exception as e_pw:
+                print(f"[scan] pywifi失敗: {e_pw}")
 
         elif system == "Darwin":
             out = subprocess.check_output(
@@ -327,7 +336,7 @@ def scan_networks() -> list:
                     continue
                 # "\:" を一時プレースホルダ文字列に置換してから ":" で分割
                 MARK = "<<COLON>>"
-                tmp = line.replace("\:", MARK)
+                tmp = line.replace("\\:", MARK)
                 parts = tmp.split(":")
                 if len(parts) < 6:
                     continue
@@ -387,6 +396,12 @@ def draw_band_axes(ax_main, nets, band_label,
 
     # ── メイングラフ ────────────────────────────────────────────────────
     freqs = [n.freq_mhz for n in nets]
+    if not freqs:
+        ax_main.set_facecolor(PANEL)
+        ax_main.text(0.5, 0.5, "スキャン中...", transform=ax_main.transAxes,
+                     ha="center", va="center", color="#AAAAAA",
+                     fontsize=int(14 * _FS))
+        return
     fmin, fmax = min(freqs) - 80, max(freqs) + 80
 
     ax_main.set_facecolor(PANEL)
@@ -417,6 +432,10 @@ def draw_band_axes(ax_main, nets, band_label,
     ax_main.tick_params(axis="both", length=0)
 
     x = np.linspace(fmin, fmax, 4000)
+
+    # BSSIDごとに1つだけラベル表示 (同一BSSID重複は除外)
+    seen_bssid: set = set()
+
     used: dict = {}
     for n in sorted(nets, key=lambda n: n.signal):
         y = bell_curve(n.freq_mhz, n.signal, n.bandwidth_mhz, x)
@@ -424,6 +443,10 @@ def draw_band_axes(ax_main, nets, band_label,
                              alpha=0.22 if n.connected else 0.16, zorder=2)
         ax_main.plot(x, y, color=n.color,
                      lw=2.2 if n.connected else 1.6, alpha=0.95, zorder=3)
+        # 同じBSSIDは1回だけラベル表示
+        if n.bssid in seen_bssid:
+            continue
+        seen_bssid.add(n.bssid)
         lx, ly = n.freq_mhz, n.signal + 2.0
         key = (round(lx / 15), round(ly / 4))
         while used.get(key):
